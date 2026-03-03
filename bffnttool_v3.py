@@ -14,6 +14,7 @@
 # - "Increase CMAP size" by adding more entries via that new CMAP (no need to resize existing blocks)
 
 import os, sys, json, struct, re
+import traceback
 from typing import Dict, List, Tuple, Optional
 from PIL import Image, ImageDraw
 
@@ -513,8 +514,10 @@ def apply_cmap_from_glyph_table(in_path: str, glyph_table_path: str, out_path: O
     if out_path is None:
         root, ext = os.path.splitext(in_path)
         out_path = root + "_cmap_table" + ext
+    if b is None:
+        raise RuntimeError("Internal error: output buffer is None. Hãy gửi lại log + folder input.")
     with open(out_path, "wb") as f:
-        f.write(b)
+        f.write(bytes(b))
 
     print("OK APPLY CMAP TABLE:", out_path)
     print(f" - Added override CMAP with {len(overrides)} codepoints (many can share glyph).")
@@ -634,16 +637,58 @@ def remap_cmap_prepend(in_path: str, map_path: str, out_path: Optional[str]=None
     if out_path is None:
         root, ext = os.path.splitext(in_path)
         out_path = root + "_cmap_new" + ext
+    if b is None:
+        raise RuntimeError("Internal error: output buffer is None. Hãy gửi lại log + folder input.")
     with open(out_path, "wb") as f:
-        f.write(b)
+        f.write(bytes(b))
 
     print("OK REMAP/EXTEND CMAP:", out_path)
     print(f" - Added {len(overrides)} entries by prepending a new scan-CMAP (method=2).")
     return out_path
 
-# ------------------ export/import main (sheet + metrics + cmap) ------------------
+# ------------------ export/import v4 (sheet + metrics + cmap embedded) ------------------
+
+def _collect_cmap_merged(b: bytes, blocks, e: str) -> Tuple[Dict[str,int], List[dict]]:
+    """
+    Returns:
+      cmap_all_dump: {"U+XXXX": glyphIndex, ...} merged (earlier blocks win)
+      cmap_blocks:   list of block descriptors (chain order)
+    """
+    # locate first CMAP base from FINF and traverse
+    finf_off, finf_size, idx_m, cmap_field_abs = find_finf_offsets(b, blocks, e)
+    first_cmap_base = u32(b, cmap_field_abs, e)
+    cmaps = traverse_cmap_chain(b, first_cmap_base, e)
+
+    cmap_blocks = []
+    merged: Dict[int,int] = {}
+    for cm in cmaps:
+        mapping = cmap_block_to_mapping(cm, e)
+        for k,v in mapping.items():
+            if k not in merged:
+                merged[k] = v
+        cmap_blocks.append({
+            "off": cm["off"],
+            "size": cm["size"],
+            "codeBegin": cm["codeBegin"],
+            "codeEnd": cm["codeEnd"],
+            "method": cm["method"],
+            "nextBase": cm["nextBase"],
+            "entries": len(mapping),
+        })
+
+    cmap_all_dump = {f"U+{k:04X}": int(v) for k,v in sorted(merged.items(), key=lambda x: x[0])}
+    return cmap_all_dump, cmap_blocks
+
 
 def export_bffnt(in_path: str):
+    """
+    v4 export:
+      - sheet0.png
+      - glyph_metrics.json  (gồm metrics + cmap + cmap_blocks)
+      - glyph_table.json    (gồm glyphs(metrics+codes) + cmap + cmap_blocks)
+      - meta.json
+    KHÔNG xuất grid.png, KHÔNG xuất cmap_all.json/cmap_blocks.json riêng nữa.
+    """
     b = open(in_path, "rb").read()
     e, header_size, num_blocks, blocks = parse_blocks(b)
 
@@ -654,30 +699,114 @@ def export_bffnt(in_path: str):
 
     t = parse_tglp_and_sheet(b, tglp_off, tglp_size, e)
     w, h = t["sheetWidth"], t["sheetHeight"]
-    raw = t["rawSheet"]
+    raw = t["rawSheet"]    # decode A8 -> PNG (alpha)  (multi-sheet)
+    sheetSize = int(t["sheetSize"])
+    sheetNum = int(t.get("sheetNum", t.get("field10", 1)))
+    raw_all = raw
+    if len(raw_all) < sheetSize:
+        raise RuntimeError("TGLP raw sheet too small")
 
-    # decode A8
-    a8_linear = unswizzle_a8_tile8_morton(raw, w, h)
-    png = make_transparent_png_from_a8(a8_linear, w, h)
-    grid = make_grid_png(w, h, t["cellWidth"], t["cellHeight"], line_alpha=96)
+    def _decode_one(chunk: bytes):
+        a8_linear = unswizzle_a8_tile8_morton(chunk, w, h)
+        return make_transparent_png_from_a8(a8_linear, w, h)
 
+    # sheet0.png .. sheetN.png
+    sheets = []
+    for si in range(sheetNum):
+        off = si * sheetSize
+        if off + sheetSize > len(raw_all):
+            break
+        chunk = raw_all[off:off + sheetSize]
+        sheets.append(_decode_one(chunk))
+    if not sheets:
+        raise RuntimeError("No sheets decoded")
+    png = sheets[0]
     cwdh_descs = parse_cwdh_blocks(b, blocks, e)
     metrics = dump_metrics(b, cwdh_descs, e)
+
+    cmap_all_dump, cmap_blocks = _collect_cmap_merged(b, blocks, e)
 
     base = os.path.splitext(os.path.basename(in_path))[0]
     out_dir = os.path.join(os.path.dirname(in_path), base + "_out")
     os.makedirs(out_dir, exist_ok=True)
 
     out_png   = os.path.join(out_dir, "sheet0.png")
-    out_grid  = os.path.join(out_dir, "grid.png")
     out_json  = os.path.join(out_dir, "glyph_metrics.json")
+    out_table = os.path.join(out_dir, "glyph_table.json")
     out_meta  = os.path.join(out_dir, "meta.json")
 
     png.save(out_png)
-    grid.save(out_grid)
+    # save additional sheets if any
+    try:
+        for si,im in enumerate(sheets[1:], start=1):
+            im.save(os.path.join(out_dir, f"sheet{si}.png"))
+    except Exception:
+        pass
 
+    # grid.png (chỉ export; import sẽ bỏ qua)
+    try:
+        from PIL import Image, ImageDraw
+        grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(grid)
+        cell_w = int(t.get("cellWidth", 0)) or int(meta.get("cellWidth", 0)) if 'meta' in locals() else int(t.get("cellWidth", 0))
+        cell_h = int(t.get("cellHeight", 0)) or int(meta.get("cellHeight", 0)) if 'meta' in locals() else int(t.get("cellHeight", 0))
+        # sheetLine/Row in parsed TGLP (field14/field12), fallback by division
+        cols = int(t.get("field14", 0)) or (w // cell_w if cell_w else 0)
+        rows = int(t.get("field12", 0)) or (h // cell_h if cell_h else 0)
+        if cell_w and cell_h and cols and rows:
+            used_w = min(w, cols * cell_w)
+            used_h = min(h, rows * cell_h)
+            for c in range(cols + 1):
+                x = c * cell_w
+                gd.line([(x, 0), (x, used_h)], fill=(255, 0, 0, 80))
+            for r in range(rows + 1):
+                y = r * cell_h
+                gd.line([(0, y), (used_w, y)], fill=(255, 0, 0, 80))
+            grid.save(os.path.join(out_dir, "grid.png"))
+    except Exception:
+        pass
+
+    # glyph_metrics.json: embed cmap + cmap_blocks for convenience
+    metrics_pack = {
+        "metrics": metrics,
+        "cmap": cmap_all_dump,
+        "cmap_blocks": cmap_blocks,
+        "format": "bffnttool_glyph_metrics"
+    }
     with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
+        json.dump(metrics_pack, f, ensure_ascii=False, indent=2)
+
+    # glyph_table.json: glyphs(metrics + codes)
+    # build codes per glyphIndex from cmap
+    gi_to_codes: Dict[int, List[str]] = {}
+    for code_str, gi in cmap_all_dump.items():
+        try:
+            gi = int(gi)
+        except Exception:
+            continue
+        gi_to_codes.setdefault(gi, []).append(code_str)
+    for gi in gi_to_codes:
+        gi_to_codes[gi] = sorted(set(gi_to_codes[gi]), key=lambda s: int(s.replace("U+",""), 16))
+
+    glyphs = []
+    for m in metrics:
+        gi = int(m.get("glyphIndex", 0))
+        glyphs.append({
+            "glyphIndex": gi,
+            "left": int(m.get("left", 0)),
+            "glyphWidth": int(m.get("glyphWidth", 0)),
+            "charWidth": int(m.get("charWidth", 0)),
+            "codes": gi_to_codes.get(gi, [])
+        })
+
+    table_pack = {
+        "glyphs": glyphs,
+        "cmap": cmap_all_dump,
+        "cmap_blocks": cmap_blocks,
+        "format": "bffnttool_glyph_table"
+    }
+    with open(out_table, "w", encoding="utf-8") as f:
+        json.dump(table_pack, f, ensure_ascii=False, indent=2)
 
     meta = {
         "sourceFile": os.path.basename(in_path),
@@ -697,24 +826,153 @@ def export_bffnt(in_path: str):
     with open(out_meta, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    # export CMAPs
-    all_path, blocks_path, n_entries, first_base = export_cmaps(b, blocks, out_dir, e)
-    # build glyph_table.json (metrics + codes per glyph)
-    glyph_table = build_glyph_table(metrics, os.path.join(out_dir, "cmap_all.json"))
-    with open(os.path.join(out_dir, "glyph_table.json"), "w", encoding="utf-8") as f:
-        json.dump(glyph_table, f, ensure_ascii=False, indent=2)
-
-
     print("OK EXPORT:", out_dir)
-    print(" - sheet0.png (glyph)")
-    print(" - grid.png (empty grid)")
-    print(" - glyph_metrics.json")
+    print(" - sheet0.png (+ sheet1.png.. nếu có)")
+    print(" - glyph_metrics.json (metrics + cmap embedded)")
+    print(" - glyph_table.json (glyphs + codes + cmap embedded)")
     print(" - meta.json")
-    print(f" - cmap_all.json ({n_entries} entries)")
-    print(" - cmap_blocks.json (list chain)")
-    print(" - glyph_table.json (metrics + codes per glyph)")
 
-def import_bffnt(in_path: str, folder: str):
+
+def _load_metrics_and_cmap_from_folder(folder: str) -> Tuple[List[dict], Dict[int,int]]:
+    """
+    Accepts:
+      - glyph_table.json (preferred) OR glyph_metrics.json
+    Returns:
+      metrics_list: list of {glyphIndex,left,glyphWidth,charWidth}
+      overrides: dict {codepoint(int) -> glyphIndex(int)} built from table 'codes' if available,
+                 else from embedded 'cmap'.
+    """
+    folder = folder.strip().strip('"')
+    tab_path = os.path.join(folder, "glyph_table.json")
+    met_path = os.path.join(folder, "glyph_metrics.json")
+
+    if os.path.isfile(tab_path):
+        pack = json.load(open(tab_path, "r", encoding="utf-8"))
+        if isinstance(pack, dict) and "glyphs" in pack:
+            glyphs = pack.get("glyphs", [])
+        elif isinstance(pack, list):
+            # backward compat: list of glyph rows
+            glyphs = pack
+        else:
+            raise ValueError("glyph_table.json không đúng định dạng.")
+
+        metrics_list = []
+        overrides: Dict[int,int] = {}
+        for row in glyphs:
+            if not isinstance(row, dict):
+                continue
+            gi = row.get("glyphIndex")
+            if gi is None:
+                continue
+            gi = int(gi)
+            metrics_list.append({
+                "glyphIndex": gi,
+                "left": int(row.get("left", 0)),
+                "glyphWidth": int(row.get("glyphWidth", 0)),
+                "charWidth": int(row.get("charWidth", 0)),
+            })
+            codes = row.get("codes", [])
+            if isinstance(codes, list):
+                for cs in codes:
+                    code = parse_code_str(str(cs))
+                    if code is None:
+                        continue
+                    overrides[int(code)] = gi
+        # fallback: if no codes, try embedded cmap
+        if not overrides and isinstance(pack, dict) and "cmap" in pack:
+            cmap = pack.get("cmap", {})
+            if isinstance(cmap, dict):
+                for k,v in cmap.items():
+                    code = parse_code_str(str(k))
+                    if code is None:
+                        continue
+                    overrides[int(code)] = int(v)
+        return metrics_list, overrides
+
+    if os.path.isfile(met_path):
+        pack = json.load(open(met_path, "r", encoding="utf-8"))
+        if isinstance(pack, dict) and "metrics" in pack:
+            metrics_list = pack.get("metrics", [])
+            cmap = pack.get("cmap", {})
+        elif isinstance(pack, list):
+            metrics_list = pack
+            cmap = {}
+        else:
+            raise ValueError("glyph_metrics.json không đúng định dạng.")
+
+        overrides: Dict[int,int] = {}
+        if isinstance(cmap, dict):
+            for k,v in cmap.items():
+                code = parse_code_str(str(k))
+                if code is None:
+                    continue
+                overrides[int(code)] = int(v)
+        return metrics_list, overrides
+
+    raise FileNotFoundError("Thiếu glyph_table.json hoặc glyph_metrics.json trong thư mục.")
+
+
+
+def _apply_cmap_overrides_prepend_bytes(b: bytearray, blocks, e: str, overrides: Dict[int,int]) -> bytearray:
+    """
+    Prepend scan-CMAP (method=2) to override existing CMAP chain.
+    - Writes a new CMAP block at end (4-byte aligned)
+    - Patches FINF firstCmapBase to point to new CMAP data base
+    - Updates header fileSize + numBlocks
+    Returns the mutated buffer.
+    """
+    if not overrides:
+        return b
+
+    finf_off, finf_size, idx_m, cmap_field_abs = find_finf_offsets(b, blocks, e)
+    old_first_base = u32(b, cmap_field_abs, e)
+
+    new_cmap_block = build_cmap_scan_block(overrides, old_first_base, e)
+    new_cmap_off = align4(len(b))
+    if new_cmap_off > len(b):
+        b += b"\x00" * (new_cmap_off - len(b))
+    b += new_cmap_block
+
+    # FINF stores "base" (offset to CMAP data, i.e. blockOff + 8)
+    new_first_base = new_cmap_off + 8
+    b[cmap_field_abs:cmap_field_abs+4] = p32(new_first_base, e)
+
+    # Patch header: fileSize + numBlocks
+    b[0x0C:0x10] = p32(len(b), e)
+    b[0x10:0x12] = p16(u16(b, 0x10, e) + 1, e)
+    return b
+
+
+def _effective_cmap_from_font(b: bytes, blocks, e: str) -> Dict[int,int]:
+    """
+    Compute the effective mapping as resolved by the CMAP chain:
+    traverse from FINF first CMAP following next links; first mapping wins on overlaps.
+    Returns dict {codepoint(int)->glyphIndex(int)}.
+    """
+    finf_off, finf_size, idx_m, cmap_field_abs = find_finf_offsets(b, blocks, e)
+    first_cmap_base = u32(b, cmap_field_abs, e)
+    cmaps = traverse_cmap_chain(b, first_cmap_base, e)
+
+    merged: Dict[int,int] = {}
+    for cm in cmaps:
+        mapping = cmap_block_to_mapping(cm, e)
+        for k, v in mapping.items():
+            if k not in merged:
+                merged[k] = v
+    return merged
+
+def import_bffnt_auto(in_path: str, folder: str):
+    """
+    v4 import:
+      - hỏi thư mục (folder) chứa sheet0.png + (glyph_table.json hoặc glyph_metrics.json)
+      - tự patch sheet0.png
+      - tự patch metrics
+      - tự remap/override cmap (prepend scan CMAP) dựa theo:
+          + codes trong glyph_table.json (ưu tiên)
+          + hoặc embedded cmap trong file json
+      - bỏ qua grid hoàn toàn
+      - output: *_new.bffnt
+    """
     b = bytearray(open(in_path, "rb").read())
     e, header_size, num_blocks, blocks = parse_blocks(b)
 
@@ -725,77 +983,83 @@ def import_bffnt(in_path: str, folder: str):
     t = parse_tglp_and_sheet(b, tglp_off, tglp_size, e)
     w, h = t["sheetWidth"], t["sheetHeight"]
 
-    png_path = os.path.join(folder, "sheet0.png")
-    metrics_path = os.path.join(folder, "glyph_metrics.json")
+    folder = folder.strip().strip('"')
+    png_path = os.path.join(folder, "sheet0.png")  # required
 
     if not os.path.isfile(png_path):
-        raise FileNotFoundError("Missing: " + png_path)
-    if not os.path.isfile(metrics_path):
-        raise FileNotFoundError("Missing: " + metrics_path)
+        raise FileNotFoundError("Missing sheet0.png: " + png_path)
 
-    # Patch sheet
-    a8_linear = rgba_png_to_a8_linear(png_path, w, h)
-    raw_swz = swizzle_a8_tile8_morton(a8_linear, w, h)
-    abs_off = t["sheetDataAbs"]
-    if abs_off + len(raw_swz) > len(b):
-        raise RuntimeError("Sheet data out of file range")
-    b[abs_off:abs_off + len(raw_swz)] = raw_swz
+    metrics_list, overrides = _load_metrics_and_cmap_from_folder(folder)
+
+    # Patch sheet (multi-sheet): sheet0.png + sheet1.png.. nếu có
+    sheetSize = int(t["sheetSize"])
+    sheetNum = int(t.get("sheetNum", t.get("field10", 1)))
+    abs_off0 = t["sheetDataAbs"]
+
+    for si in range(sheetNum):
+        pimg = os.path.join(folder, f"sheet{si}.png")
+        if si == 0 and not os.path.isfile(pimg):
+            pimg = png_path
+        if not os.path.isfile(pimg):
+            # missing sheet => keep original
+            continue
+        a8_linear = rgba_png_to_a8_linear(pimg, w, h)
+        if a8_linear is None:
+            raise RuntimeError("rgba_png_to_a8_linear() returned None")
+        raw_swz = swizzle_a8_tile8_morton(a8_linear, w, h)
+        abs_off = abs_off0 + si * sheetSize
+        if abs_off + len(raw_swz) > len(b):
+            raise RuntimeError("Sheet data out of file range")
+        b[abs_off:abs_off + len(raw_swz)] = raw_swz
+
 
     # Patch metrics
     cwdh_descs = parse_cwdh_blocks(b, blocks, e)
-    metrics = json.load(open(metrics_path, "r", encoding="utf-8"))
-    apply_metrics_patch(b, cwdh_descs, metrics, e)
+    apply_metrics_patch(b, cwdh_descs, metrics_list, e)
+
+    # Auto CMAP override
+    # Auto CMAP override (chỉ khi khác mapping gốc) để tránh "lệch glyph" khi repack không chỉnh gì
+    if overrides:
+        try:
+            current = _effective_cmap_from_font(b, blocks, e)
+            if current == overrides:
+                overrides = {}
+        except Exception:
+            pass
+    b = _apply_cmap_overrides_prepend_bytes(b, blocks, e, overrides)
 
     root, ext = os.path.splitext(in_path)
     out_path = root + "_new" + ext
+    if b is None:
+        raise RuntimeError("Internal error: output buffer is None. Hãy gửi lại log + folder input.")
     with open(out_path, "wb") as f:
-        f.write(b)
+        f.write(bytes(b))
 
     print("OK IMPORT:", out_path)
-    print("(CMAP không đổi trong chế độ import. Nếu cần remap/extend cmap, dùng lệnh/menu Remap.)")
+    if overrides:
+        print(f" - Auto CMAP override: {len(overrides)} codepoints (prepend scan-CMAP).")
+    else:
+        print(" - Auto CMAP override: không có mapping (giữ nguyên CMAP).")
+    return out_path
 
-# ------------------ CLI/menu ------------------
+# ------------------ CLI/menu v4 (only Export/Import) ------------------
 
 def menu():
-    print("=== BFFNT Tool v2 (Export/Import/CMAP) ===")
-    print("1) Xuất: sheet0.png + grid.png + glyph_metrics.json + cmap_all.json")
-    print("2) Nhập: patch sheet0.png + glyph_metrics.json -> *_new.bffnt (bỏ qua grid.png)")
-    print("3) Xuất CMAP-only (cmap_all.json + cmap_blocks.json)")
-    print("4) Remap/Extend CMAP: dùng map.txt (prepend scan CMAP) -> *_cmap_new.bffnt")
-    choice = input("Chọn (1/2/3/4): ").strip()
+    print("=== BFFNT Tool v4 (Export/Import auto CMAP) ===")
+    print("1) Xuất: sheet0.png + glyph_metrics.json + glyph_table.json + meta.json")
+    print("2) Nhập: hỏi thư mục -> patch ảnh + metrics + tự remap cmap -> *_new.bffnt")
+    choice = input("Chọn (1/2): ").strip()
 
     if choice == "1":
         in_path = input("Nhập đường dẫn .bffnt: ").strip().strip('"')
         export_bffnt(in_path)
-
     elif choice == "2":
         in_path = input("Nhập đường dẫn .bffnt gốc: ").strip().strip('"')
-        folder = input("Nhập thư mục chứa sheet0.png + glyph_metrics.json: ").strip().strip('"')
-        import_bffnt(in_path, folder)
-
-    elif choice == "3":
-        in_path = input("Nhập đường dẫn .bffnt: ").strip().strip('"')
-        b = open(in_path, "rb").read()
-        e, _, _, blocks = parse_blocks(b)
-        base = os.path.splitext(os.path.basename(in_path))[0]
-        out_dir = os.path.join(os.path.dirname(in_path), base + "_out")
-        all_path, blocks_path, n_entries, _ = export_cmaps(b, blocks, out_dir, e)
-        print("OK EXPORT CMAP:", out_dir)
-        print(f" - cmap_all.json ({n_entries} entries)")
-        print(" - cmap_blocks.json")
-
-    elif choice == "4":
-        in_path = input("Nhập đường dẫn .bffnt gốc: ").strip().strip('"')
-        map_path = input("Nhập đường dẫn map.txt (mỗi dòng: SRC_HEX DST_HEX): ").strip().strip('"')
-        remap_cmap_prepend(in_path, map_path)
-
-    elif choice == "5":
-        in_path = input("Nhập đường dẫn .bffnt gốc: ").strip().strip('"')
-        tab_path = input("Nhập đường dẫn glyph_table.json: ").strip().strip('"')
-        apply_cmap_from_glyph_table(in_path, tab_path)
-
+        folder = input("Nhập thư mục chứa sheet0.png + glyph_table.json/glyph_metrics.json: ").strip().strip('"')
+        import_bffnt_auto(in_path, folder)
     else:
         print("Hủy.")
+
 
 def main(argv):
     if len(argv) <= 1:
@@ -804,18 +1068,15 @@ def main(argv):
     cmd = argv[1].lower()
     if cmd == "export" and len(argv) >= 3:
         return export_bffnt(argv[2])
-    if cmd == "import" and len(argv) >= 4:
-        return import_bffnt(argv[2], argv[3])
-    if cmd == "remap" and len(argv) >= 4:
-        return remap_cmap_prepend(argv[2], argv[3])
-    if cmd in ("cmaptab","applycmap") and len(argv) >= 4:
-        return apply_cmap_from_glyph_table(argv[2], argv[3])
+    if cmd == "import" and len(argv) >= 3:
+        in_path = argv[2]
+        folder = argv[3] if len(argv) >= 4 else input("Nhập thư mục chứa sheet0.png + glyph_table.json/glyph_metrics.json: ").strip().strip('"')
+        return import_bffnt_auto(in_path, folder)
 
     print("Usage:")
-    print("  python bffnttool_v3.py")
-    print("  python bffnttool_v3.py export <font.bffnt>")
-    print("  python bffnttool_v3.py import <font.bffnt> <folder_out>")
-    print("  python bffnttool_v3.py remap  <font.bffnt> <map.txt>")
+    print("  python bffnttool.py")
+    print("  python bffnttool.py export <font.bffnt>")
+    print("  python bffnttool.py import <font.bffnt> <folder>")
     sys.exit(2)
 
 if __name__ == "__main__":
@@ -823,4 +1084,5 @@ if __name__ == "__main__":
         main(sys.argv)
     except Exception as e:
         print("[ERROR]", e)
+        traceback.print_exc()
         sys.exit(1)
