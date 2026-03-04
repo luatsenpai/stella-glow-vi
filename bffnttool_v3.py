@@ -85,6 +85,173 @@ def swizzle_a8_tile8_morton(a8_linear: bytes, w: int, h: int) -> bytes:
             out[di] = a8_linear[y*w + x]
     return bytes(out)
 
+
+def unswizzle_a4_tile8_morton(raw: bytes, w: int, h: int, high_nibble_first: bool = True) -> bytes:
+    """
+    formatId=11 (A4): 4-bit alpha, 8x8 tile order, morton within tile.
+    Returns A8 linear bytes (expanded to 0..255).
+    """
+    tiles_x = w // 8
+    out = bytearray(w * h)
+    for y in range(h):
+        ty, iy = divmod(y, 8)
+        for x in range(w):
+            tx, ix = divmod(x, 8)
+            tile_index = ty * tiles_x + tx
+            tile_base = tile_index * 32  # 64 pixels / 2 = 32 bytes
+            pi = morton3(ix, iy)  # 0..63
+            bi = tile_base + (pi >> 1)
+            if bi >= len(raw):
+                a = 0
+            else:
+                byte = raw[bi]
+                if high_nibble_first:
+                    nib = (byte >> 4) if ((pi & 1) == 0) else (byte & 0x0F)
+                else:
+                    nib = (byte & 0x0F) if ((pi & 1) == 0) else (byte >> 4)
+                a = nib * 17
+            out[y * w + x] = a
+    return bytes(out)
+
+def swizzle_a4_tile8_morton(a8_linear: bytes, w: int, h: int, high_nibble_first: bool = True) -> bytes:
+    """
+    formatId=11 (A4): take A8 linear alpha, quantize to 4-bit, pack 2 pixels/byte, swizzle tile8 morton.
+    Returns raw A4 swizzled bytes length = w*h/2.
+    """
+    tiles_x = w // 8
+    out = bytearray((w * h) // 2)
+    for y in range(h):
+        ty, iy = divmod(y, 8)
+        for x in range(w):
+            tx, ix = divmod(x, 8)
+            tile_index = ty * tiles_x + tx
+            tile_base = tile_index * 32
+            pi = morton3(ix, iy)
+            bi = tile_base + (pi >> 1)
+            if bi >= len(out):
+                continue
+            a = a8_linear[y * w + x]
+            nib = (a + 8) // 17  # round to 0..15
+            if nib < 0: nib = 0
+            if nib > 15: nib = 15
+            cur = out[bi]
+            if high_nibble_first:
+                if (pi & 1) == 0:
+                    cur = (cur & 0x0F) | (nib << 4)
+                else:
+                    cur = (cur & 0xF0) | nib
+            else:
+                if (pi & 1) == 0:
+                    cur = (cur & 0xF0) | nib
+                else:
+                    cur = (cur & 0x0F) | (nib << 4)
+            out[bi] = cur
+    return bytes(out)
+
+
+def _choose_a4_nibble_order(raw: bytes, w: int, h: int) -> bool:
+    """
+    Return high_nibble_first boolean.
+    Better heuristic for "double layer/ghost": choose the nibble order that yields smoother alpha field
+    (lower high-frequency / checkerboard artifacts).
+    We compare total variation (sum abs diffs with right/bottom neighbors). Lower is better.
+    """
+    a_high = unswizzle_a4_tile8_morton(raw, w, h, True)
+    a_low  = unswizzle_a4_tile8_morton(raw, w, h, False)
+
+    def score(a: bytes) -> int:
+        tv = 0
+        # sample every 2 pixels to keep it fast on big sheets
+        step = 2
+        for y in range(0, h-1, step):
+            row = y * w
+            row2 = (y+1) * w
+            for x in range(0, w-1, step):
+                i = row + x
+                tv += abs(a[i] - a[i+1])
+                tv += abs(a[i] - a[row2 + x])
+        return tv
+
+    s_high = score(a_high)
+    s_low  = score(a_low)
+    return True if s_high <= s_low else False
+
+def decode_sheet_to_png(raw: bytes, w: int, h: int, format_id: int) -> Image.Image:
+    """
+    Robust decoder for CTR BFFNT sheet formats.
+    Common values seen in the wild:
+      - 0x24 (36) : A8   (sheetSize == w*h)
+      - 0x40 (64) : A4   (sheetSize == w*h/2)
+    Also supports legacy ids: 8=A8, 11=A4.
+    If format_id is unknown, we infer from raw length (sheetSize).
+    """
+    # Normalize known ids
+    if format_id in (8, 0x24, 36):
+        a8 = unswizzle_a8_tile8_morton(raw, w, h)
+        return make_transparent_png_from_a8(a8, w, h)
+    if format_id in (11, 0x40, 64):
+        high = _choose_a4_nibble_order(raw, w, h)
+        a8 = unswizzle_a4_tile8_morton(raw, w, h, high)
+        img = make_transparent_png_from_a8(a8, w, h)
+        try:
+            img.info["a4_high_nibble_first"] = "1" if high else "0"
+        except Exception:
+            pass
+        return img
+
+    # Infer from sheet size
+    if len(raw) == w * h:
+        a8 = unswizzle_a8_tile8_morton(raw, w, h)
+        return make_transparent_png_from_a8(a8, w, h)
+    if len(raw) == (w * h) // 2:
+        high = _choose_a4_nibble_order(raw, w, h)
+        a8 = unswizzle_a4_tile8_morton(raw, w, h, high)
+        img = make_transparent_png_from_a8(a8, w, h)
+        try:
+            img.info["a4_high_nibble_first"] = "1" if high else "0"
+        except Exception:
+            pass
+        return img
+
+    raise ValueError(f"Unsupported sheet formatId={format_id} and cannot infer from raw size={len(raw)} (w*h={w*h}).")
+
+def encode_png_to_sheet_raw(png_path: str, w: int, h: int, format_id: int, expected_size: int = 0, a4_high_nibble_first: bool = True) -> bytes:
+    """
+    Convert PNG (alpha) -> swizzled raw bytes for TGLP.
+    Supports A8 and A4 with robust id mapping and size inference.
+    expected_size: if provided, will override inference (useful when format_id is unknown).
+    """
+    a8_linear = rgba_png_to_a8_linear(png_path, w, h)
+
+    # Normalize known ids
+    if format_id in (8, 0x24, 36):
+        out = swizzle_a8_tile8_morton(a8_linear, w, h)
+        if expected_size and len(out) != expected_size:
+            # try A4 if mismatch
+            out2 = swizzle_a4_tile8_morton(a8_linear, w, h, a4_high_nibble_first)
+            if len(out2) == expected_size:
+                return out2
+        return out
+    if format_id in (11, 0x40, 64):
+        out = swizzle_a4_tile8_morton(a8_linear, w, h, a4_high_nibble_first)
+        if expected_size and len(out) != expected_size:
+            # try A8 if mismatch
+            out2 = swizzle_a8_tile8_morton(a8_linear, w, h)
+            if len(out2) == expected_size:
+                return out2
+        return out
+
+    # Infer by expected size if provided
+    if expected_size:
+        if expected_size == w * h:
+            return swizzle_a8_tile8_morton(a8_linear, w, h)
+        if expected_size == (w * h) // 2:
+            return swizzle_a4_tile8_morton(a8_linear, w, h, a4_high_nibble_first)
+
+    # Fallback inference by common sizes
+    # Default to A8 if ambiguous
+    return swizzle_a8_tile8_morton(a8_linear, w, h)
+
 def make_transparent_png_from_a8(a8: bytes, w: int, h: int) -> Image.Image:
     alpha = Image.frombytes("L", (w, h), a8)
     rgba = Image.new("RGBA", (w, h), (255, 255, 255, 0))
@@ -96,6 +263,37 @@ def rgba_png_to_a8_linear(png_path: str, w: int, h: int) -> bytes:
     if img.size != (w, h):
         raise ValueError(f"PNG size {img.size} != expected {(w,h)}")
     return img.split()[3].tobytes()
+
+
+
+def alpha_to_grayscale_png(img: Image.Image) -> Image.Image:
+    """Return L image of alpha channel (0..255) for easier editing."""
+    im = img.convert("RGBA")
+    return im.split()[3].convert("L")
+
+def despeckle_alpha(img: Image.Image, min_alpha: int = 34, median: int = 3) -> Image.Image:
+    """
+    Reduce A4 'speckle' by:
+      - zeroing very small alpha (<min_alpha)
+      - optional median filter on alpha (median=3 recommended)
+    Keeps antialias (unlike hard binary threshold).
+    """
+    from PIL import ImageFilter
+    im = img.convert("RGBA")
+    r,g,b,a = im.split()
+    a2 = a.point(lambda v: 0 if v < min_alpha else v)
+    if median and median >= 3:
+        a2 = a2.filter(ImageFilter.MedianFilter(size=median))
+    return Image.merge("RGBA", (r,g,b,a2))
+def clean_alpha_binary(img: Image.Image, threshold: int = 128) -> Image.Image:
+    """
+    Make alpha strictly 0/255 to remove speckle / antialias noise (useful for A4 preview/edit).
+    Returns new RGBA image.
+    """
+    im = img.convert("RGBA")
+    r,g,b,a = im.split()
+    a2 = a.point(lambda v: 255 if v >= threshold else 0)
+    return Image.merge("RGBA", (r,g,b,a2))
 
 def make_grid_png(w: int, h: int, cell_w: int, cell_h: int, line_alpha: int = 96) -> Image.Image:
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -707,8 +905,7 @@ def export_bffnt(in_path: str):
         raise RuntimeError("TGLP raw sheet too small")
 
     def _decode_one(chunk: bytes):
-        a8_linear = unswizzle_a8_tile8_morton(chunk, w, h)
-        return make_transparent_png_from_a8(a8_linear, w, h)
+        return decode_sheet_to_png(chunk, w, h, int(t.get("formatId", t.get("field11", 8))))
 
     # sheet0.png .. sheetN.png
     sheets = []
@@ -736,12 +933,6 @@ def export_bffnt(in_path: str):
     out_meta  = os.path.join(out_dir, "meta.json")
 
     png.save(out_png)
-    # save additional sheets if any
-    try:
-        for si,im in enumerate(sheets[1:], start=1):
-            im.save(os.path.join(out_dir, f"sheet{si}.png"))
-    except Exception:
-        pass
 
     # grid.png (chỉ export; import sẽ bỏ qua)
     try:
@@ -771,7 +962,7 @@ def export_bffnt(in_path: str):
         "metrics": metrics,
         "cmap": cmap_all_dump,
         "cmap_blocks": cmap_blocks,
-        "format": "bffnttool_glyph_metrics"
+        "format": "bffnttool_v4_glyph_metrics"
     }
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(metrics_pack, f, ensure_ascii=False, indent=2)
@@ -803,7 +994,7 @@ def export_bffnt(in_path: str):
         "glyphs": glyphs,
         "cmap": cmap_all_dump,
         "cmap_blocks": cmap_blocks,
-        "format": "bffnttool_glyph_table"
+        "format": "bffnttool_v4_glyph_table"
     }
     with open(out_table, "w", encoding="utf-8") as f:
         json.dump(table_pack, f, ensure_ascii=False, indent=2)
@@ -818,6 +1009,8 @@ def export_bffnt(in_path: str):
         "baselinePos": t["baselinePos"],
         "maxCharWidth": t["maxCharWidth"],
         "formatId": t["formatId"],
+        "a4_high_nibble_first": (png.info.get("a4_high_nibble_first","1") if isinstance(getattr(png, "info", None), dict) else "1"),
+        "a4_nibble": ("high" if (png.info.get("a4_high_nibble_first","1") if isinstance(getattr(png, "info", None), dict) else "1") in ("1",1,True,"true") else "low"),
         "sheetSize": t["sheetSize"],
         "sheetDataAbs": t["sheetDataAbs"],
         "sheetDataOffset": t["sheetDataOffset"],
@@ -827,7 +1020,7 @@ def export_bffnt(in_path: str):
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     print("OK EXPORT:", out_dir)
-    print(" - sheet0.png (+ sheet1.png.. nếu có)")
+    print(" - sheet0.png")
     print(" - glyph_metrics.json (metrics + cmap embedded)")
     print(" - glyph_table.json (glyphs + codes + cmap embedded)")
     print(" - meta.json")
@@ -843,6 +1036,20 @@ def _load_metrics_and_cmap_from_folder(folder: str) -> Tuple[List[dict], Dict[in
                  else from embedded 'cmap'.
     """
     folder = folder.strip().strip('"')
+    a4_high = True
+    meta_path = os.path.join(folder, "meta.json")
+    if os.path.isfile(meta_path):
+        try:
+            m = json.load(open(meta_path, "r", encoding="utf-8"))
+            v = m.get("a4_nibble")
+            if isinstance(v, str) and v.lower().strip() in ("low","lo","0","false"):
+                a4_high = False
+            elif isinstance(v, str) and v.lower().strip() in ("high","hi","1","true"):
+                a4_high = True
+            elif str(m.get("a4_high_nibble_first", "")).strip() in ("0","false","False"):
+                a4_high = False
+        except Exception:
+            pass
     tab_path = os.path.join(folder, "glyph_table.json")
     met_path = os.path.join(folder, "glyph_metrics.json")
 
@@ -984,6 +1191,20 @@ def import_bffnt_auto(in_path: str, folder: str):
     w, h = t["sheetWidth"], t["sheetHeight"]
 
     folder = folder.strip().strip('"')
+    a4_high = True
+    meta_path = os.path.join(folder, "meta.json")
+    if os.path.isfile(meta_path):
+        try:
+            m = json.load(open(meta_path, "r", encoding="utf-8"))
+            v = m.get("a4_nibble")
+            if isinstance(v, str) and v.lower().strip() in ("low","lo","0","false"):
+                a4_high = False
+            elif isinstance(v, str) and v.lower().strip() in ("high","hi","1","true"):
+                a4_high = True
+            elif str(m.get("a4_high_nibble_first", "")).strip() in ("0","false","False"):
+                a4_high = False
+        except Exception:
+            pass
     png_path = os.path.join(folder, "sheet0.png")  # required
 
     if not os.path.isfile(png_path):
@@ -996,8 +1217,17 @@ def import_bffnt_auto(in_path: str, folder: str):
     sheetNum = int(t.get("sheetNum", t.get("field10", 1)))
     abs_off0 = t["sheetDataAbs"]
 
-    for si in range(sheetNum):
+        # giới hạn số sheet thực sự có trong file (tránh out of range)
+    tglp_end = tglp_off + tglp_size
+    maxSheets = (tglp_end - abs_off0) // sheetSize if sheetSize > 0 else 0
+    sheetNumEff = min(sheetNum, maxSheets)
+
+    for si in range(sheetNumEff):
         pimg = os.path.join(folder, f"sheet{si}.png")
+        # if user provides edited version, prefer it
+        pedit = os.path.join(folder, f"sheet{si}_edit.png")
+        if os.path.isfile(pedit):
+            pimg = pedit
         if si == 0 and not os.path.isfile(pimg):
             pimg = png_path
         if not os.path.isfile(pimg):
@@ -1006,7 +1236,7 @@ def import_bffnt_auto(in_path: str, folder: str):
         a8_linear = rgba_png_to_a8_linear(pimg, w, h)
         if a8_linear is None:
             raise RuntimeError("rgba_png_to_a8_linear() returned None")
-        raw_swz = swizzle_a8_tile8_morton(a8_linear, w, h)
+        raw_swz = encode_png_to_sheet_raw(pimg, w, h, int(t.get("formatId", t.get("field11", 8))), expected_size=sheetSize, a4_high_nibble_first=a4_high)
         abs_off = abs_off0 + si * sheetSize
         if abs_off + len(raw_swz) > len(b):
             raise RuntimeError("Sheet data out of file range")
@@ -1074,9 +1304,9 @@ def main(argv):
         return import_bffnt_auto(in_path, folder)
 
     print("Usage:")
-    print("  python bffnttool.py")
-    print("  python bffnttool.py export <font.bffnt>")
-    print("  python bffnttool.py import <font.bffnt> <folder>")
+    print("  python bffnttool_v4.py")
+    print("  python bffnttool_v4.py export <font.bffnt>")
+    print("  python bffnttool_v4.py import <font.bffnt> <folder>")
     sys.exit(2)
 
 if __name__ == "__main__":
